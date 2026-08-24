@@ -3,8 +3,9 @@ package transport
 import (
 	"encoding/json"
 	"log"
-	"my-first-api/internal/todo"
 	"net/http"
+
+	"github.com/Emmanuel-Wantua/goland-api.git/internal/todo"
 )
 
 type TodoItem struct {

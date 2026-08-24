@@ -1,4 +1,4 @@
-module my-first-api
+module github.com/Emmanuel-Wantua/goland-api.git
 
 go 1.26
 

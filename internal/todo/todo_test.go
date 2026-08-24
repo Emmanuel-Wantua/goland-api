@@ -2,10 +2,11 @@ package todo_test
 
 import (
 	"context"
-	"my-first-api/internal/db"
-	"my-first-api/internal/todo"
 	"reflect"
 	"testing"
+
+	"github.com/Emmanuel-Wantua/goland-api.git/internal/db"
+	"github.com/Emmanuel-Wantua/goland-api.git/internal/todo"
 )
 
 type MockDB struct {

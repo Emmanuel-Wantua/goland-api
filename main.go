@@ -2,9 +2,10 @@ package main
 
 import (
 	"log"
-	"my-first-api/internal/db"
-	"my-first-api/internal/todo"
-	"my-first-api/internal/transport"
+
+	"github.com/Emmanuel-Wantua/goland-api.git/internal/db"
+	"github.com/Emmanuel-Wantua/goland-api.git/internal/todo"
+	"github.com/Emmanuel-Wantua/goland-api.git/internal/transport"
 )
 
 //type safeTodo struct {

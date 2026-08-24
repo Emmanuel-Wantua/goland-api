@@ -4,8 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"my-first-api/internal/db"
 	"strings"
+
+	"github.com/Emmanuel-Wantua/goland-api.git/internal/db"
 )
 
 type Item struct {
