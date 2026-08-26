@@ -9,7 +9,7 @@ import (
 
 // In-memory array data structures
 var (
-	mockTodos = []string{"Finish BitesizeGo project", "Deploy backend to Vercel", "Test interactive UI"}
+	mockTodos = []string{"Deploy backend to Vercel", "Test interactive UI"}
 	// Mutex lock protects concurrent read/write data races in serverless requests
 	mu sync.RWMutex
 )
