@@ -2,80 +2,145 @@ package handler
 
 import (
 	"encoding/json"
-	"errors"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
+	"sync"
 
+	"github.com/Emmanuel-Wantua/goland-api.git/internal/db"
 	"github.com/Emmanuel-Wantua/goland-api.git/internal/todo"
 )
 
-type Handler struct {
+var (
+	serviceOnce sync.Once
 	todoService *todo.Service
+	serviceErr  error
+)
+
+func getTodoService() (*todo.Service, error) {
+	serviceOnce.Do(func() {
+		port := 5432
+
+		if value := os.Getenv("DB_PORT"); value != "" {
+			parsedPort, err := strconv.Atoi(value)
+			if err != nil {
+				serviceErr = err
+				return
+			}
+
+			port = parsedPort
+		}
+
+		database, err := db.New(
+			os.Getenv("DB_USER"),
+			os.Getenv("DB_PASSWORD"),
+			os.Getenv("DB_NAME"),
+			os.Getenv("DB_HOST"),
+			port,
+		)
+		if err != nil {
+			serviceErr = err
+			return
+		}
+
+		todoService = todo.NewService(database)
+	})
+
+	return todoService, serviceErr
 }
 
-func NewHandler(todoService *todo.Service) *Handler {
-	return &Handler{
-		todoService: todoService,
-	}
-}
-
-func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+// Handler is the Vercel entry point.
+func Handler(w http.ResponseWriter, r *http.Request) {
 	// CORS
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
-	// Preflight
+	// Browser preflight
 	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
+	// Get the todo service.
+	svc, err := getTodoService()
+	if err != nil {
+		writeJSONError(
+			w,
+			http.StatusInternalServerError,
+			"failed to initialize todo service",
+		)
+		return
+	}
+
+	// Remove trailing slash.
 	path := strings.TrimSuffix(r.URL.Path, "/")
 
-	// API tester/frontend
-	if path == "" || path == "/api" || path == "/api/index" {
-		h.serveFrontend(w)
+	// Vercel can pass the request path differently depending on rewrites.
+	// Support the common paths.
+	switch path {
+	case "", "/api", "/api/index":
+		serveFrontend(w)
+		return
+
+	case "/api/todos":
+		handleTodos(w, r, svc)
+		return
+
+	case "/api/todos/search":
+		handleSearch(w, r, svc)
+		return
+
+	default:
+		writeJSONError(
+			w,
+			http.StatusNotFound,
+			"endpoint route mapping not found",
+		)
 		return
 	}
-
-	// GET /api/todos
-	// POST /api/todos
-	if path == "/api/todos" {
-		switch r.Method {
-		case http.MethodGet:
-			h.getAllTodos(w, r)
-		case http.MethodPost:
-			h.addTodo(w, r)
-		default:
-			writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
-		}
-		return
-	}
-
-	// GET /api/todos/search?q=...
-	if path == "/api/todos/search" {
-		if r.Method != http.MethodGet {
-			writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
-
-		h.searchTodos(w, r)
-		return
-	}
-
-	writeJSONError(w, http.StatusNotFound, "endpoint route mapping not found")
 }
 
 // GET /api/todos
-func (h *Handler) getAllTodos(w http.ResponseWriter, r *http.Request) {
-	items, err := h.todoService.GetAll()
+// POST /api/todos
+func handleTodos(
+	w http.ResponseWriter,
+	r *http.Request,
+	svc *todo.Service,
+) {
+	switch r.Method {
+	case http.MethodGet:
+		getAllTodos(w, r, svc)
+
+	case http.MethodPost:
+		addTodo(w, r, svc)
+
+	default:
+		writeJSONError(
+			w,
+			http.StatusMethodNotAllowed,
+			"method not allowed",
+		)
+	}
+}
+
+// GET /api/todos
+func getAllTodos(
+	w http.ResponseWriter,
+	r *http.Request,
+	svc *todo.Service,
+) {
+	items, err := svc.GetAll()
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(
+			w,
+			http.StatusInternalServerError,
+			"failed to get todos",
+		)
 		return
 	}
 
-	// Make sure the frontend receives [] instead of null
 	if items == nil {
 		items = []todo.Item{}
 	}
@@ -85,63 +150,108 @@ func (h *Handler) getAllTodos(w http.ResponseWriter, r *http.Request) {
 
 // POST /api/todos
 //
-// Body:
-// {
-//   "task": "Deploy backend to Vercel"
-// }
-func (h *Handler) addTodo(w http.ResponseWriter, r *http.Request) {
+// Request:
+//
+//	{
+//	    "task": "Deploy backend to Vercel"
+//	}
+func addTodo(
+	w http.ResponseWriter,
+	r *http.Request,
+	svc *todo.Service,
+) {
+	defer r.Body.Close()
+
 	var data struct {
 		Task string `json:"task"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid json request body")
+		writeJSONError(
+			w,
+			http.StatusBadRequest,
+			"invalid JSON request body",
+		)
 		return
 	}
 
 	task := strings.TrimSpace(data.Task)
 
 	if task == "" {
-		writeJSONError(w, http.StatusBadRequest, "task content cannot be blank")
+		writeJSONError(
+			w,
+			http.StatusBadRequest,
+			"task content cannot be blank",
+		)
 		return
 	}
 
-	err := h.todoService.Add(task)
+	err := svc.Add(task)
 	if err != nil {
-		if errors.Is(err, errors.New("todo is not unique")) {
-			writeJSONError(w, http.StatusConflict, "todo already exists")
-			return
-		}
-
-		// Your service currently returns a wrapped error, so check
-		// the error message for the uniqueness error.
+		// Your current todo.Service returns this error as:
+		// "todo is not unique"
 		if strings.Contains(err.Error(), "todo is not unique") {
-			writeJSONError(w, http.StatusConflict, "todo already exists")
+			writeJSONError(
+				w,
+				http.StatusConflict,
+				"todo already exists",
+			)
 			return
 		}
 
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(
+			w,
+			http.StatusInternalServerError,
+			"failed to add todo",
+		)
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, map[string]string{
-		"status": "success",
-		"task":   task,
-	})
+	writeJSON(
+		w,
+		http.StatusCreated,
+		map[string]string{
+			"status": "success",
+			"task":   task,
+		},
+	)
 }
 
 // GET /api/todos/search?q=deploy
-func (h *Handler) searchTodos(w http.ResponseWriter, r *http.Request) {
-	query := strings.TrimSpace(r.URL.Query().Get("q"))
-
-	if query == "" {
-		writeJSONError(w, http.StatusBadRequest, "search query cannot be blank")
+func handleSearch(
+	w http.ResponseWriter,
+	r *http.Request,
+	svc *todo.Service,
+) {
+	if r.Method != http.MethodGet {
+		writeJSONError(
+			w,
+			http.StatusMethodNotAllowed,
+			"method not allowed",
+		)
 		return
 	}
 
-	results, err := h.todoService.Search(query)
+	query := strings.TrimSpace(
+		r.URL.Query().Get("q"),
+	)
+
+	if query == "" {
+		writeJSONError(
+			w,
+			http.StatusBadRequest,
+			"search query cannot be blank",
+		)
+		return
+	}
+
+	results, err := svc.Search(query)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(
+			w,
+			http.StatusInternalServerError,
+			"failed to search todos",
+		)
 		return
 	}
 
@@ -152,31 +262,47 @@ func (h *Handler) searchTodos(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, results)
 }
 
-func writeJSON(w http.ResponseWriter, status int, data interface{}) {
+func writeJSON(
+	w http.ResponseWriter,
+	status int,
+	data interface{},
+) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		// At this point headers have already been written.
-		return
-	}
+	_ = json.NewEncoder(w).Encode(data)
 }
 
-func writeJSONError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, map[string]string{
-		"error": message,
-	})
+func writeJSONError(
+	w http.ResponseWriter,
+	status int,
+	message string,
+) {
+	writeJSON(
+		w,
+		status,
+		map[string]string{
+			"error": message,
+		},
+	)
 }
 
-func (h *Handler) serveFrontend(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+func serveFrontend(w http.ResponseWriter) {
+	w.Header().Set(
+		"Content-Type",
+		"text/html; charset=utf-8",
+	)
 
-	w.Write([]byte(`
+	_, _ = w.Write([]byte(`
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
 	<meta charset="UTF-8">
-	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<meta
+		name="viewport"
+		content="width=device-width, initial-scale=1.0"
+	>
 
 	<title>Todo App</title>
 
@@ -186,7 +312,11 @@ func (h *Handler) serveFrontend(w http.ResponseWriter) {
 		}
 
 		body {
-			font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+			font-family:
+				-apple-system,
+				BlinkMacSystemFont,
+				"Segoe UI",
+				sans-serif;
 			background: #f5f7fb;
 			color: #222;
 			margin: 0;
@@ -279,8 +409,10 @@ func (h *Handler) serveFrontend(w http.ResponseWriter) {
 </head>
 
 <body>
+
 	<div class="container">
 		<div class="card">
+
 			<h1>Todo List</h1>
 
 			<div id="error" class="error"></div>
@@ -309,8 +441,11 @@ func (h *Handler) serveFrontend(w http.ResponseWriter) {
 			<h3>Tasks</h3>
 
 			<ul id="todoList">
-				<li class="message">Loading...</li>
+				<li class="message">
+					Loading...
+				</li>
 			</ul>
+
 		</div>
 	</div>
 
@@ -323,20 +458,25 @@ func (h *Handler) serveFrontend(w http.ResponseWriter) {
 			try {
 				const response = await fetch(API);
 
+				const data = await response.json();
+
 				if (!response.ok) {
-					throw new Error('Failed to load todos');
+					throw new Error(
+						data.error || 'Failed to load todos'
+					);
 				}
 
-				const items = await response.json();
+				renderTodos(data);
 
-				renderTodos(items);
 			} catch (error) {
 				showError(error.message);
 			}
 		}
 
 		async function addTask() {
-			const input = document.getElementById('todoInput');
+			const input =
+				document.getElementById('todoInput');
+
 			const task = input.value.trim();
 
 			if (!task) {
@@ -359,13 +499,20 @@ func (h *Handler) serveFrontend(w http.ResponseWriter) {
 				const data = await response.json();
 
 				if (!response.ok) {
-					throw new Error(data.error || 'Failed to add todo');
+					throw new Error(
+						data.error || 'Failed to add todo'
+					);
 				}
 
 				input.value = '';
 
-				// Always reload from the database.
-				// Nothing is added directly to the frontend array.
+				/*
+				 * Do NOT add the todo directly to the
+				 * frontend.
+				 *
+				 * Reload from the API so the database
+				 * remains the source of truth.
+				 */
 				await loadTasks();
 
 			} catch (error) {
@@ -374,14 +521,16 @@ func (h *Handler) serveFrontend(w http.ResponseWriter) {
 		}
 
 		async function searchTodos() {
-			const query = document
-				.getElementById('searchInput')
-				.value
-				.trim();
+			const input =
+				document.getElementById('searchInput');
+
+			const query = input.value.trim();
 
 			clearError();
 
-			// Empty search means "get all"
+			/*
+			 * Empty search means get everything.
+			 */
 			if (!query) {
 				await loadTasks();
 				return;
@@ -389,13 +538,17 @@ func (h *Handler) serveFrontend(w http.ResponseWriter) {
 
 			try {
 				const response = await fetch(
-					API + '/search?q=' + encodeURIComponent(query)
+					API +
+					'/search?q=' +
+					encodeURIComponent(query)
 				);
 
 				const results = await response.json();
 
 				if (!response.ok) {
-					throw new Error(results.error || 'Search failed');
+					throw new Error(
+						results.error || 'Search failed'
+					);
 				}
 
 				renderSearchResults(results);
@@ -406,41 +559,53 @@ func (h *Handler) serveFrontend(w http.ResponseWriter) {
 		}
 
 		function renderTodos(items) {
-			const list = document.getElementById('todoList');
+			const list =
+				document.getElementById('todoList');
 
 			if (!items || items.length === 0) {
 				list.innerHTML =
-					'<li class="message">No todos yet.</li>';
+					'<li class="message">' +
+					'No todos yet.' +
+					'</li>';
+
 				return;
 			}
 
 			list.innerHTML = items.map(function(item) {
-				return `
-					<li>
-						<span>${escapeHtml(item.Task)}</span>
-						<span class="status">
-							${escapeHtml(item.Status)}
-						</span>
-					</li>
-				`;
+				return (
+					'<li>' +
+						'<span>' +
+							escapeHtml(item.Task) +
+						'</span>' +
+						'<span class="status">' +
+							escapeHtml(item.Status) +
+						'</span>' +
+					'</li>'
+				);
 			}).join('');
 		}
 
 		function renderSearchResults(results) {
-			const list = document.getElementById('todoList');
+			const list =
+				document.getElementById('todoList');
 
 			if (!results || results.length === 0) {
 				list.innerHTML =
-					'<li class="message">No matching todos.</li>';
+					'<li class="message">' +
+					'No matching todos.' +
+					'</li>';
+
 				return;
 			}
 
 			list.innerHTML = results.map(function(task) {
-				return `
-					<li>
-						<span>${escapeHtml(task)}</span>
-					</li>
-				`;
+				return (
+					'<li>' +
+						'<span>' +
+							escapeHtml(task) +
+						'</span>' +
+					'</li>'
+				);
 			}).join('');
 		}
 
@@ -454,23 +619,29 @@ func (h *Handler) serveFrontend(w http.ResponseWriter) {
 		}
 
 		function showError(message) {
-			document.getElementById('error').textContent = message;
+			document.getElementById('error')
+				.textContent = message;
 		}
 
 		function clearError() {
-			document.getElementById('error').textContent = '';
+			document.getElementById('error')
+				.textContent = '';
 		}
 
 		document
 			.getElementById('todoInput')
-			.addEventListener('keydown', function(event) {
-				if (event.key === 'Enter') {
-					addTask();
+			.addEventListener(
+				'keydown',
+				function(event) {
+					if (event.key === 'Enter') {
+						addTask();
+					}
 				}
-			});
+			);
 
 		window.onload = loadTasks;
 	</script>
+
 </body>
 </html>
 	`))
