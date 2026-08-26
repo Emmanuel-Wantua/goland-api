@@ -53,7 +53,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			</head>
 			<body>
 				<div class="card">
-					<h2>📋 To-Do API Client</h2>
+					<h2>To-Do API Client</h2>
 					<input type="text" id="todoInput" placeholder="Add a new task...">
 					<button onclick="addTask()">Add Task</button>
 					<h3>Active Tasks:</h3>
