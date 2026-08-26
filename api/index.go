@@ -3,62 +3,161 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
-
-	"github.com/Emmanuel-Wantua/goland-api.git/internal/db"
-	"github.com/Emmanuel-Wantua/goland-api.git/internal/todo"
 )
 
+var ErrTodoNotUnique = errors.New("todo is not unique")
 
-// temporaryDB is a temporary in-memory implementation of
-// todo.Manager.
-//
-// Replace this with *db.DB when you have PostgreSQL.
+type Item struct {
+	Task   string `json:"Task"`
+	Status string `json:"Status"`
+}
+
+type Manager interface {
+	InsertItem(ctx context.Context, item Item) error
+	GetAllItems(ctx context.Context) ([]Item, error)
+}
+
 type temporaryDB struct {
 	mu    sync.RWMutex
-	items []db.Item
+	items []Item
 }
 
 func newTemporaryDB() *temporaryDB {
 	return &temporaryDB{
-		items: make([]db.Item, 0),
+		items: make([]Item, 0),
 	}
 }
 
-func (m *temporaryDB) InsertItem(
+func (db *temporaryDB) InsertItem(
 	_ context.Context,
-	item db.Item,
+	item Item,
 ) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	db.mu.Lock()
+	defer db.mu.Unlock()
 
-	m.items = append(m.items, item)
+	db.items = append(db.items, item)
 
 	return nil
 }
 
-func (m *temporaryDB) GetAllItems(
+func (db *temporaryDB) GetAllItems(
 	_ context.Context,
-) ([]db.Item, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+) ([]Item, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
 
-	items := make([]db.Item, len(m.items))
-	copy(items, m.items)
+	items := make([]Item, len(db.items))
+	copy(items, db.items)
 
 	return items, nil
 }
 
+type Service struct {
+	db Manager
+}
+
+func NewService(db Manager) *Service {
+	return &Service{
+		db: db,
+	}
+}
+
+func (svc *Service) Add(task string) error {
+	task = strings.TrimSpace(task)
+
+	if task == "" {
+		return errors.New("todo cannot be blank")
+	}
+
+	items, err := svc.GetAll()
+	if err != nil {
+		return err
+	}
+
+	for _, item := range items {
+		if strings.EqualFold(
+			strings.TrimSpace(item.Task),
+			task,
+		) {
+			return ErrTodoNotUnique
+		}
+	}
+
+	err = svc.db.InsertItem(
+		context.Background(),
+		Item{
+			Task:   task,
+			Status: "TO_BE_STARTED",
+		},
+	)
+
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (svc *Service) GetAll() ([]Item, error) {
+	items, err := svc.db.GetAllItems(
+		context.Background(),
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if items == nil {
+		return []Item{}, nil
+	}
+
+	return items, nil
+}
+
+func (svc *Service) Search(
+	query string,
+) ([]string, error) {
+	query = strings.TrimSpace(query)
+
+	if query == "" {
+		return []string{}, nil
+	}
+
+	items, err := svc.GetAll()
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]string, 0)
+
+	for _, item := range items {
+		if strings.Contains(
+			strings.ToLower(item.Task),
+			strings.ToLower(query),
+		) {
+			results = append(
+				results,
+				item.Task,
+			)
+		}
+	}
+
+	return results, nil
+}
+
 var (
 	store = newTemporaryDB()
-	svc   = todo.NewService(store)
+	svc   = NewService(store)
 )
 
-// Handler is the Vercel entry point.
-func Handler(w http.ResponseWriter, r *http.Request) {
-	// CORS
+func Handler(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	w.Header().Set(
 		"Access-Control-Allow-Origin",
 		"*",
@@ -74,14 +173,15 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		"Content-Type",
 	)
 
-	// Browser preflight
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	// Remove trailing slash.
-	path := strings.TrimSuffix(r.URL.Path, "/")
+	path := strings.TrimSuffix(
+		r.URL.Path,
+		"/",
+	)
 
 	switch path {
 	case "":
@@ -108,15 +208,14 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// GET /api/todos
-// POST /api/todos
 func handleTodos(
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
 	switch r.Method {
+
 	case http.MethodGet:
-		getAllTodos(w, r)
+		getAllTodos(w)
 
 	case http.MethodPost:
 		addTodo(w, r)
@@ -130,12 +229,9 @@ func handleTodos(
 	}
 }
 
-// GET /api/todos
-func getAllTodos(
-	w http.ResponseWriter,
-	r *http.Request,
-) {
+func getAllTodos(w http.ResponseWriter) {
 	items, err := svc.GetAll()
+
 	if err != nil {
 		writeJSONError(
 			w,
@@ -145,10 +241,6 @@ func getAllTodos(
 		return
 	}
 
-	if items == nil {
-		items = []todo.Item{}
-	}
-
 	writeJSON(
 		w,
 		http.StatusOK,
@@ -156,11 +248,6 @@ func getAllTodos(
 	)
 }
 
-// POST /api/todos
-//
-// {
-//   "task": "Learn Go"
-// }
 func addTodo(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -171,9 +258,11 @@ func addTodo(
 		Task string `json:"task"`
 	}
 
-	if err := json.NewDecoder(
+	err := json.NewDecoder(
 		r.Body,
-	).Decode(&data); err != nil {
+	).Decode(&data)
+
+	if err != nil {
 		writeJSONError(
 			w,
 			http.StatusBadRequest,
@@ -193,12 +282,13 @@ func addTodo(
 		return
 	}
 
-	err := svc.Add(task)
+	err = svc.Add(task)
 
 	if err != nil {
-		if strings.Contains(
-			err.Error(),
-			"todo is not unique",
+
+		if errors.Is(
+			err,
+			ErrTodoNotUnique,
 		) {
 			writeJSONError(
 				w,
@@ -226,7 +316,6 @@ func addTodo(
 	)
 }
 
-// GET /api/todos/search?q=go
 func handleSearch(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -262,10 +351,6 @@ func handleSearch(
 			"failed to search todos",
 		)
 		return
-	}
-
-	if results == nil {
-		results = []string{}
 	}
 
 	writeJSON(
@@ -325,6 +410,7 @@ func serveFrontend(w http.ResponseWriter) {
 	<title>Todo App</title>
 
 	<style>
+
 		* {
 			box-sizing: border-box;
 		}
@@ -435,6 +521,7 @@ func serveFrontend(w http.ResponseWriter) {
 			color: #d93025;
 			margin-bottom: 15px;
 		}
+
 	</style>
 </head>
 
@@ -471,7 +558,6 @@ func serveFrontend(w http.ResponseWriter) {
 					type="text"
 					id="searchInput"
 					placeholder="Search todos..."
-					oninput="searchTodos()"
 				>
 
 			</div>
@@ -543,20 +629,21 @@ func serveFrontend(w http.ResponseWriter) {
 			try {
 
 				const response =
-					await fetch(API, {
+					await fetch(
+						API,
+						{
+							method: 'POST',
 
-						method: 'POST',
+							headers: {
+								'Content-Type':
+									'application/json'
+							},
 
-						headers: {
-							'Content-Type':
-								'application/json'
-						},
-
-						body: JSON.stringify({
-							task: task
-						})
-
-					});
+							body: JSON.stringify({
+								task: task
+							})
+						}
+					);
 
 				const data =
 					await response.json();
@@ -572,12 +659,6 @@ func serveFrontend(w http.ResponseWriter) {
 
 				input.value = '';
 
-				/*
-				 * Reload from the API.
-				 *
-				 * The frontend never creates
-				 * its own todo list.
-				 */
 				await loadTasks();
 
 			} catch (error) {
@@ -599,10 +680,6 @@ func serveFrontend(w http.ResponseWriter) {
 
 			clearError();
 
-			/*
-			 * Empty search means
-			 * get all todos.
-			 */
 			if (!query) {
 
 				await loadTasks();
@@ -776,6 +853,13 @@ func serveFrontend(w http.ResponseWriter) {
 					}
 
 				}
+			);
+
+		document
+			.getElementById('searchInput')
+			.addEventListener(
+				'input',
+				searchTodos
 			);
 
 		window.onload = loadTasks;
