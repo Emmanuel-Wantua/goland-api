@@ -1,10 +1,9 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
-	"os"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -12,50 +11,68 @@ import (
 	"github.com/Emmanuel-Wantua/goland-api.git/internal/todo"
 )
 
-var (
-	serviceOnce sync.Once
-	todoService *todo.Service
-	serviceErr  error
-)
 
-func getTodoService() (*todo.Service, error) {
-	serviceOnce.Do(func() {
-		port := 5432
-
-		if value := os.Getenv("DB_PORT"); value != "" {
-			parsedPort, err := strconv.Atoi(value)
-			if err != nil {
-				serviceErr = err
-				return
-			}
-
-			port = parsedPort
-		}
-
-		database, err := db.New(
-			os.Getenv("DB_USER"),
-			os.Getenv("DB_PASSWORD"),
-			os.Getenv("DB_NAME"),
-			os.Getenv("DB_HOST"),
-			port,
-		)
-		if err != nil {
-			serviceErr = err
-			return
-		}
-
-		todoService = todo.NewService(database)
-	})
-
-	return todoService, serviceErr
+// temporaryDB is a temporary in-memory implementation of
+// todo.Manager.
+//
+// Replace this with *db.DB when you have PostgreSQL.
+type temporaryDB struct {
+	mu    sync.RWMutex
+	items []db.Item
 }
+
+func newTemporaryDB() *temporaryDB {
+	return &temporaryDB{
+		items: make([]db.Item, 0),
+	}
+}
+
+func (m *temporaryDB) InsertItem(
+	_ context.Context,
+	item db.Item,
+) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.items = append(m.items, item)
+
+	return nil
+}
+
+func (m *temporaryDB) GetAllItems(
+	_ context.Context,
+) ([]db.Item, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	items := make([]db.Item, len(m.items))
+	copy(items, m.items)
+
+	return items, nil
+}
+
+var (
+	store = newTemporaryDB()
+	svc   = todo.NewService(store)
+)
 
 // Handler is the Vercel entry point.
 func Handler(w http.ResponseWriter, r *http.Request) {
 	// CORS
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set(
+		"Access-Control-Allow-Origin",
+		"*",
+	)
+
+	w.Header().Set(
+		"Access-Control-Allow-Methods",
+		"GET, POST, OPTIONS",
+	)
+
+	w.Header().Set(
+		"Access-Control-Allow-Headers",
+		"Content-Type",
+	)
 
 	// Browser preflight
 	if r.Method == http.MethodOptions {
@@ -63,34 +80,24 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get the todo service.
-	svc, err := getTodoService()
-	if err != nil {
-		writeJSONError(
-			w,
-			http.StatusInternalServerError,
-			"failed to initialize todo service",
-		)
-		return
-	}
-
 	// Remove trailing slash.
 	path := strings.TrimSuffix(r.URL.Path, "/")
 
-	// Vercel can pass the request path differently depending on rewrites.
-	// Support the common paths.
 	switch path {
-	case "", "/api", "/api/index":
+	case "":
 		serveFrontend(w)
-		return
+
+	case "/api":
+		serveFrontend(w)
+
+	case "/api/index":
+		serveFrontend(w)
 
 	case "/api/todos":
-		handleTodos(w, r, svc)
-		return
+		handleTodos(w, r)
 
 	case "/api/todos/search":
-		handleSearch(w, r, svc)
-		return
+		handleSearch(w, r)
 
 	default:
 		writeJSONError(
@@ -98,7 +105,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			http.StatusNotFound,
 			"endpoint route mapping not found",
 		)
-		return
 	}
 }
 
@@ -107,14 +113,13 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 func handleTodos(
 	w http.ResponseWriter,
 	r *http.Request,
-	svc *todo.Service,
 ) {
 	switch r.Method {
 	case http.MethodGet:
-		getAllTodos(w, r, svc)
+		getAllTodos(w, r)
 
 	case http.MethodPost:
-		addTodo(w, r, svc)
+		addTodo(w, r)
 
 	default:
 		writeJSONError(
@@ -129,7 +134,6 @@ func handleTodos(
 func getAllTodos(
 	w http.ResponseWriter,
 	r *http.Request,
-	svc *todo.Service,
 ) {
 	items, err := svc.GetAll()
 	if err != nil {
@@ -145,20 +149,21 @@ func getAllTodos(
 		items = []todo.Item{}
 	}
 
-	writeJSON(w, http.StatusOK, items)
+	writeJSON(
+		w,
+		http.StatusOK,
+		items,
+	)
 }
 
 // POST /api/todos
 //
-// Request:
-//
-//	{
-//	    "task": "Deploy backend to Vercel"
-//	}
+// {
+//   "task": "Learn Go"
+// }
 func addTodo(
 	w http.ResponseWriter,
 	r *http.Request,
-	svc *todo.Service,
 ) {
 	defer r.Body.Close()
 
@@ -166,7 +171,9 @@ func addTodo(
 		Task string `json:"task"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+	if err := json.NewDecoder(
+		r.Body,
+	).Decode(&data); err != nil {
 		writeJSONError(
 			w,
 			http.StatusBadRequest,
@@ -187,10 +194,12 @@ func addTodo(
 	}
 
 	err := svc.Add(task)
+
 	if err != nil {
-		// Your current todo.Service returns this error as:
-		// "todo is not unique"
-		if strings.Contains(err.Error(), "todo is not unique") {
+		if strings.Contains(
+			err.Error(),
+			"todo is not unique",
+		) {
 			writeJSONError(
 				w,
 				http.StatusConflict,
@@ -217,11 +226,10 @@ func addTodo(
 	)
 }
 
-// GET /api/todos/search?q=deploy
+// GET /api/todos/search?q=go
 func handleSearch(
 	w http.ResponseWriter,
 	r *http.Request,
-	svc *todo.Service,
 ) {
 	if r.Method != http.MethodGet {
 		writeJSONError(
@@ -246,6 +254,7 @@ func handleSearch(
 	}
 
 	results, err := svc.Search(query)
+
 	if err != nil {
 		writeJSONError(
 			w,
@@ -259,7 +268,11 @@ func handleSearch(
 		results = []string{}
 	}
 
-	writeJSON(w, http.StatusOK, results)
+	writeJSON(
+		w,
+		http.StatusOK,
+		results,
+	)
 }
 
 func writeJSON(
@@ -267,7 +280,11 @@ func writeJSON(
 	status int,
 	data interface{},
 ) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set(
+		"Content-Type",
+		"application/json",
+	)
+
 	w.WriteHeader(status)
 
 	_ = json.NewEncoder(w).Encode(data)
@@ -299,6 +316,7 @@ func serveFrontend(w http.ResponseWriter) {
 
 <head>
 	<meta charset="UTF-8">
+
 	<meta
 		name="viewport"
 		content="width=device-width, initial-scale=1.0"
@@ -317,8 +335,10 @@ func serveFrontend(w http.ResponseWriter) {
 				BlinkMacSystemFont,
 				"Segoe UI",
 				sans-serif;
+
 			background: #f5f7fb;
 			color: #222;
+
 			margin: 0;
 			padding: 40px 20px;
 		}
@@ -332,7 +352,10 @@ func serveFrontend(w http.ResponseWriter) {
 			background: white;
 			border-radius: 16px;
 			padding: 24px;
-			box-shadow: 0 8px 30px rgba(0, 0, 0, 0.08);
+
+			box-shadow:
+				0 8px 30px
+				rgba(0, 0, 0, 0.08);
 		}
 
 		h1 {
@@ -348,17 +371,22 @@ func serveFrontend(w http.ResponseWriter) {
 		input {
 			flex: 1;
 			padding: 12px;
+
 			border: 1px solid #d5d9e2;
 			border-radius: 8px;
+
 			font-size: 15px;
 		}
 
 		button {
 			border: none;
 			border-radius: 8px;
+
 			padding: 12px 18px;
+
 			background: #0070f3;
 			color: white;
+
 			cursor: pointer;
 			font-weight: 600;
 		}
@@ -379,7 +407,9 @@ func serveFrontend(w http.ResponseWriter) {
 
 		li {
 			padding: 14px;
+
 			border-bottom: 1px solid #eee;
+
 			display: flex;
 			justify-content: space-between;
 			gap: 20px;
@@ -411,13 +441,18 @@ func serveFrontend(w http.ResponseWriter) {
 <body>
 
 	<div class="container">
+
 		<div class="card">
 
 			<h1>Todo List</h1>
 
-			<div id="error" class="error"></div>
+			<div
+				id="error"
+				class="error"
+			></div>
 
 			<div class="form">
+
 				<input
 					type="text"
 					id="todoInput"
@@ -427,57 +462,77 @@ func serveFrontend(w http.ResponseWriter) {
 				<button onclick="addTask()">
 					Add
 				</button>
+
 			</div>
 
 			<div class="search">
+
 				<input
 					type="text"
 					id="searchInput"
 					placeholder="Search todos..."
 					oninput="searchTodos()"
 				>
+
 			</div>
 
 			<h3>Tasks</h3>
 
 			<ul id="todoList">
+
 				<li class="message">
 					Loading...
 				</li>
+
 			</ul>
 
 		</div>
+
 	</div>
 
 	<script>
+
 		const API = '/api/todos';
 
 		async function loadTasks() {
+
 			clearError();
 
 			try {
-				const response = await fetch(API);
 
-				const data = await response.json();
+				const response =
+					await fetch(API);
+
+				const data =
+					await response.json();
 
 				if (!response.ok) {
+
 					throw new Error(
-						data.error || 'Failed to load todos'
+						data.error ||
+						'Failed to load todos'
 					);
+
 				}
 
 				renderTodos(data);
 
 			} catch (error) {
+
 				showError(error.message);
+
 			}
 		}
 
 		async function addTask() {
-			const input =
-				document.getElementById('todoInput');
 
-			const task = input.value.trim();
+			const input =
+				document.getElementById(
+					'todoInput'
+				);
+
+			const task =
+				input.value.trim();
 
 			if (!task) {
 				return;
@@ -486,83 +541,119 @@ func serveFrontend(w http.ResponseWriter) {
 			clearError();
 
 			try {
-				const response = await fetch(API, {
-					method: 'POST',
-					headers: {
-						'Content-Type': 'application/json'
-					},
-					body: JSON.stringify({
-						task: task
-					})
-				});
 
-				const data = await response.json();
+				const response =
+					await fetch(API, {
+
+						method: 'POST',
+
+						headers: {
+							'Content-Type':
+								'application/json'
+						},
+
+						body: JSON.stringify({
+							task: task
+						})
+
+					});
+
+				const data =
+					await response.json();
 
 				if (!response.ok) {
+
 					throw new Error(
-						data.error || 'Failed to add todo'
+						data.error ||
+						'Failed to add todo'
 					);
+
 				}
 
 				input.value = '';
 
 				/*
-				 * Do NOT add the todo directly to the
-				 * frontend.
+				 * Reload from the API.
 				 *
-				 * Reload from the API so the database
-				 * remains the source of truth.
+				 * The frontend never creates
+				 * its own todo list.
 				 */
 				await loadTasks();
 
 			} catch (error) {
+
 				showError(error.message);
+
 			}
 		}
 
 		async function searchTodos() {
-			const input =
-				document.getElementById('searchInput');
 
-			const query = input.value.trim();
+			const input =
+				document.getElementById(
+					'searchInput'
+				);
+
+			const query =
+				input.value.trim();
 
 			clearError();
 
 			/*
-			 * Empty search means get everything.
+			 * Empty search means
+			 * get all todos.
 			 */
 			if (!query) {
+
 				await loadTasks();
+
 				return;
 			}
 
 			try {
-				const response = await fetch(
-					API +
-					'/search?q=' +
-					encodeURIComponent(query)
-				);
 
-				const results = await response.json();
+				const response =
+					await fetch(
+						API +
+						'/search?q=' +
+						encodeURIComponent(query)
+					);
+
+				const results =
+					await response.json();
 
 				if (!response.ok) {
+
 					throw new Error(
-						results.error || 'Search failed'
+						results.error ||
+						'Search failed'
 					);
+
 				}
 
-				renderSearchResults(results);
+				renderSearchResults(
+					results
+				);
 
 			} catch (error) {
+
 				showError(error.message);
+
 			}
 		}
 
 		function renderTodos(items) {
-			const list =
-				document.getElementById('todoList');
 
-			if (!items || items.length === 0) {
+			const list =
+				document.getElementById(
+					'todoList'
+				);
+
+			if (
+				!items ||
+				items.length === 0
+			) {
+
 				list.innerHTML =
 					'<li class="message">' +
 					'No todos yet.' +
@@ -571,25 +662,44 @@ func serveFrontend(w http.ResponseWriter) {
 				return;
 			}
 
-			list.innerHTML = items.map(function(item) {
-				return (
-					'<li>' +
-						'<span>' +
-							escapeHtml(item.Task) +
-						'</span>' +
-						'<span class="status">' +
-							escapeHtml(item.Status) +
-						'</span>' +
-					'</li>'
-				);
-			}).join('');
+			list.innerHTML =
+				items.map(function(item) {
+
+					return (
+						'<li>' +
+
+							'<span>' +
+								escapeHtml(
+									item.Task
+								) +
+							'</span>' +
+
+							'<span class="status">' +
+								escapeHtml(
+									item.Status
+								) +
+							'</span>' +
+
+						'</li>'
+					);
+
+				}).join('');
 		}
 
-		function renderSearchResults(results) {
-			const list =
-				document.getElementById('todoList');
+		function renderSearchResults(
+			results
+		) {
 
-			if (!results || results.length === 0) {
+			const list =
+				document.getElementById(
+					'todoList'
+				);
+
+			if (
+				!results ||
+				results.length === 0
+			) {
+
 				list.innerHTML =
 					'<li class="message">' +
 					'No matching todos.' +
@@ -598,34 +708,59 @@ func serveFrontend(w http.ResponseWriter) {
 				return;
 			}
 
-			list.innerHTML = results.map(function(task) {
-				return (
-					'<li>' +
-						'<span>' +
-							escapeHtml(task) +
-						'</span>' +
-					'</li>'
-				);
-			}).join('');
+			list.innerHTML =
+				results.map(function(task) {
+
+					return (
+						'<li>' +
+
+							'<span>' +
+								escapeHtml(task) +
+							'</span>' +
+
+						'</li>'
+					);
+
+				}).join('');
 		}
 
 		function escapeHtml(value) {
+
 			return String(value)
-				.replace(/&/g, '&amp;')
-				.replace(/</g, '&lt;')
-				.replace(/>/g, '&gt;')
-				.replace(/"/g, '&quot;')
-				.replace(/'/g, '&#039;');
+				.replace(
+					/&/g,
+					'&amp;'
+				)
+				.replace(
+					/</g,
+					'&lt;'
+				)
+				.replace(
+					/>/g,
+					'&gt;'
+				)
+				.replace(
+					/"/g,
+					'&quot;'
+				)
+				.replace(
+					/'/g,
+					'&#039;'
+				);
 		}
 
 		function showError(message) {
-			document.getElementById('error')
-				.textContent = message;
+
+			document.getElementById(
+				'error'
+			).textContent = message;
 		}
 
 		function clearError() {
-			document.getElementById('error')
-				.textContent = '';
+
+			document.getElementById(
+				'error'
+			).textContent = '';
 		}
 
 		document
@@ -633,16 +768,22 @@ func serveFrontend(w http.ResponseWriter) {
 			.addEventListener(
 				'keydown',
 				function(event) {
-					if (event.key === 'Enter') {
+
+					if (
+						event.key === 'Enter'
+					) {
 						addTask();
 					}
+
 				}
 			);
 
 		window.onload = loadTasks;
+
 	</script>
 
 </body>
+
 </html>
 	`))
 }
