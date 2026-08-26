@@ -64,7 +64,7 @@ func NewService(db Manager) *Service {
 //	}
 //}
 
-func (svc *Service) Add(todo string) error {
+func (svc *Service) Add(ctx context.Context, todo string) error {
 	items, err := svc.GetAll()
 	if err != nil {
 		return fmt.Errorf("failed to read from db: %w", err)
@@ -84,7 +84,7 @@ func (svc *Service) Add(todo string) error {
 	return nil
 }
 
-func (svc *Service) Search(query string) ([]string, error) {
+func (svc *Service) Search(ctx context.Context, query string) ([]string, error) {
 	items, err := svc.GetAll()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read from db: %w", err)
@@ -99,9 +99,9 @@ func (svc *Service) Search(query string) ([]string, error) {
 	return results, nil
 }
 
-func (svc *Service) GetAll() ([]Item, error) {
+func (svc *Service) GetAll(ctx context.Context) ([]Item, error) {
 	var results []Item
-	items, err := svc.db.GetAllItems(context.Background())
+	items, err := svc.db.GetAllItems(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read from db: %w", err)
 	}
